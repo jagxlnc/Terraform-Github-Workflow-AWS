@@ -68,14 +68,111 @@ jobs:
               body: output
             })
 
+  checkov-scan:
+    name: 'Checkov Security Scan'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov
+        id: checkov
+        run: |
+          checkov -d . --quiet --output-file-path checkov-report.json --output json
+        continue-on-error: true
+
+      - name: Generate Checkov Report Summary
+        id: checkov_summary
+        if: always()
+        run: |
+          echo "### Checkov Security Scan Results" > checkov-summary.md
+          echo "" >> checkov-summary.md
+          
+          if [ -f checkov-report.json ]; then
+            PASSED=$(cat checkov-report.json | grep -o '"passed": [0-9]*' | awk '{sum += $2} END {print sum}')
+            FAILED=$(cat checkov-report.json | grep -o '"failed": [0-9]*' | awk '{sum += $2} END {print sum}')
+            SKIPPED=$(cat checkov-report.json | grep -o '"skipped": [0-9]*' | awk '{sum += $2} END {print sum}')
+            
+            echo "- ✅ **Passed:** $PASSED" >> checkov-summary.md
+            echo "- ❌ **Failed:** $FAILED" >> checkov-summary.md
+            echo "- ⏭️ **Skipped:** $SKIPPED" >> checkov-summary.md
+            echo "" >> checkov-summary.md
+            
+            if [ "$FAILED" -gt 0 ]; then
+              echo "#### Failed Checks" >> checkov-summary.md
+              echo "" >> checkov-summary.md
+              echo "<details><summary>Show Failed Checks</summary>" >> checkov-summary.md
+              echo "" >> checkov-summary.md
+              
+              # Extract and format failed checks
+              cat checkov-report.json | jq -r '.results.failed_checks[] | "- **" + .check_id + "**: " + .check_name + " (" + .file_path + ":" + (.file_line_range[0] | tostring) + ")"' >> checkov-summary.md
+              
+              echo "" >> checkov-summary.md
+              echo "</details>" >> checkov-summary.md
+            fi
+          else
+            echo "⚠️ No Checkov report found" >> checkov-summary.md
+          fi
+          
+          cat checkov-summary.md
+
+      - name: Upload Checkov Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: checkov-report.json
+          retention-days: 7
+
+      - name: Post Checkov Results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('checkov-summary.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+      - name: Check Checkov Status
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ -f checkov-report.json ]; then
+            FAILED=$(cat checkov-report.json | grep -o '"failed": [0-9]*' | awk '{sum += $2} END {print sum}')
+            if [ "$FAILED" -gt 0 ] && [ "${{ github.event_name }}" == "push" ]; then
+              echo "::warning::Checkov found $FAILED security issues. Review the report for details."
+            fi
+            
+            # For workflow_dispatch, we want to fail if there are high severity issues
+            if [ "$FAILED" -gt 0 ] && [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+              echo "::error::Checkov found $FAILED security issues. Cannot deploy to production with security issues."
+              exit 1
+            fi
+          fi
+
   terraform-plan:
     name: 'Terraform Plan'
-    needs: terraform-validate
+    needs: [terraform-validate, checkov-scan]
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     env:
       TF_VAR_environment: ${{ github.event.inputs.environment || 'dev' }}
       TF_VAR_bucket_name: ${{ secrets.TF_VAR_BUCKET_NAME || format('static-website-{0}', github.run_id) }}
+      TF_VAR_domain_name: ${{ secrets.TF_VAR_DOMAIN_NAME || 'example.com' }}
     
     steps:
       - name: Checkout Repository
@@ -140,6 +237,7 @@ jobs:
     env:
       TF_VAR_environment: ${{ github.event.inputs.environment || 'dev' }}
       TF_VAR_bucket_name: ${{ secrets.TF_VAR_BUCKET_NAME || format('static-website-{0}', github.run_id) }}
+      TF_VAR_domain_name: ${{ secrets.TF_VAR_DOMAIN_NAME || 'example.com' }}
     
     steps:
       - name: Checkout Repository
