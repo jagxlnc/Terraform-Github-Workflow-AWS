@@ -1,0 +1,82 @@
+name: 'Terraform Destroy'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy (dev/staging/prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirmation:
+        description: 'Type "destroy" to confirm deletion of resources'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  terraform-destroy:
+    name: 'Terraform Destroy'
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirmation == 'destroy'
+    env:
+      TF_VAR_environment: ${{ github.event.inputs.environment }}
+      TF_VAR_bucket_name: ${{ secrets.TF_VAR_BUCKET_NAME || format('static-website-{0}', github.run_id) }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Empty S3 Bucket
+        run: |
+          BUCKET_NAME=$(terraform output -raw s3_bucket_name || echo "")
+          if [ ! -z "$BUCKET_NAME" ]; then
+            echo "Emptying bucket $BUCKET_NAME before destroy"
+            aws s3 rm s3://$BUCKET_NAME --recursive
+          else
+            echo "No bucket name found in outputs, skipping bucket emptying"
+          fi
+        continue-on-error: true
+
+      - name: Terraform Destroy
+        id: destroy
+        run: terraform destroy -auto-approve -input=false
+
+      - name: Post Destroy Results
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Destroy Complete ✅
+            
+            *Resources in \`${{ env.TF_VAR_environment }}\` environment have been destroyed by @${{ github.actor }}*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number || 1,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+        continue-on-error: true
